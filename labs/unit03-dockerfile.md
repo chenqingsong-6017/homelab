@@ -80,6 +80,39 @@ Successfully tagged myhello:v3
 2. 老构建器对每条 RUN/CMD 都起一个**临时容器**（`Running in …`），跑完 `Removed intermediate container …` 删掉——镜像就是这么一层层砌出来的。
 3. `docker run` 时被执行的**只有 CMD**：`hi` 出现、`building now` 消失。
 
+### F. COPY：把文件搬进镜像（10-26）
+
+Dockerfile 四行（`FROM` 用本地镜像 ID 是应急写法，原因见下方环境墙第三次）：
+```
+FROM d9e853e87e55
+RUN echo building now
+COPY hello.txt /app/hello.txt
+CMD ["cat", "/app/hello.txt"]
+```
+先造文件：`echo "hello from inside the image" > hello.txt`
+
+构建（`DOCKER_BUILDKIT=0 docker build -t myhello:v4 .`）四步：
+- `Step 1/4 : FROM d9e853e87e55` → `---> d9e853e87e55`（**本地命中，无拉取、无 resolve**）
+- `Step 2/4 : RUN echo building now` → `---> Using cache`（同内容层复用）
+- `Step 3/4 : COPY hello.txt /app/hello.txt` → `---> 2a772bee1784`（**新层**）
+- `Step 4/4 : CMD` → `Successfully tagged myhello:v4`
+
+运行 `docker run myhello:v4` → 屏幕打印 `hello from inside the image`。
+
+`docker history myhello:v4`：
+```
+IMAGE          CREATED      CREATED BY                                    SIZE
+aeb0fea7e802   4 min ago    #(nop) CMD ["cat" "/app/hello.txt"]           0B
+2a772bee1784   4 min ago    #(nop) COPY file:bcb2e24f3b172b9a…            1.4kB
+912d0c6ec2c0   3 days ago   /bin/sh -c echo building now                  0B
+d9e853e87e55   6 months ago  CMD ["/bin/sh"]                                0B
+<missing>      6 months ago  ADD alpine-minirootfs-3.20.10-x86_64.tar.gz…  8.11MB
+```
+三条结论：
+1. **COPY 把文件搬进镜像，有体积**（1.4kB）；`CMD` 是配置（0B）。
+2. **层体积看「文件系统变没变」，不看「打印了什么」**：`RUN echo building now` 往终端打了一行字但没改文件系统 → 那层也是 **0B**。
+3. `COPY` 会自动创建不存在的父目录（本例的 `/app`）。
+
 ## 环境墙实战（troubleshooting，真实踩坑）
 
 - 现象：把 CMD 改成 JSON 形式后重跑 `docker build -t myhello:v2 .`，报
@@ -93,7 +126,12 @@ Successfully tagged myhello:v3
   2. Dockerfile 改 `FROM alpine:3.20` —— 纯短名，不带域名
   3. `DOCKER_BUILDKIT=0 docker build -t myhello:v3 .` —— `Step 1/3` 直接 `---> 49e053e87e55` 命中本地，零网络请求
 - **结论（以后写 Dockerfile 的默认写法）**：FROM 一律用本地已有短名；需要新基础镜像时先 `pull` → `tag` 挂短名 → 再改 FROM。
-- 待办：把稳定源写进 `daemon.json` 做全局镜像加速（挂账，未做）。
+- **第三次（10-26）**：`FROM alpine:3.20` 报 `dial tcp … registry-1.docker.io:443: connect: connection refused`（短名默认指 docker.io）。处置：
+  1. **配 `daemon.json` 镜像加速**（写 `/etc/docker/daemon.json` ＋ `systemctl restart docker`）：`{"registry-mirrors": ["https://docker.1ms.run", "https://docker.m.daocloud.io"]}`；`docker info | grep -A 1 "Registry Mirrors"` 已能列出＝配置生效。
+  2. 但仍失败：daocloud 回 `403 Forbidden … this image is not in the allowlist`（第二次撞同一政策），1ms 也不给。`--offline` 标志此 buildx 版本不支持（`unknown flag: --offline`）。
+  3. **最终绕法：`FROM` 直接写本地镜像 ID**（`FROM d9e853e87e55`）＋ `DOCKER_BUILDKIT=0` —— 老构建器按 ID 直接查本地，**不发任何网络请求**，`Step 1/4` 直接命中。
+- **边界（必须写清）**：用镜像 ID 只是**离线应急**——ID 只在本机有效、不可移植，也不进公开仓库的正式版本；有网络时 FROM 仍应写短名（`alpine:3.20`）。同一条 Dockerfile 在本机跑通≠别人的机器能构建。
+- ~~待办：把稳定源写进 `daemon.json`~~ → **已完成（10-26，见第三次处置第 1 条）**；但镜像站本身不稳定，仍需保留「先用 ID/短名跑通、再换源重试」的习惯。
 
 ## 命令小记（本次新出现）
 
