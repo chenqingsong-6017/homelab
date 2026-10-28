@@ -113,6 +113,37 @@ d9e853e87e55   6 months ago  CMD ["/bin/sh"]                                0B
 2. **层体积看「文件系统变没变」，不看「打印了什么」**：`RUN echo building now` 往终端打了一行字但没改文件系统 → 那层也是 **0B**。
 3. `COPY` 会自动创建不存在的父目录（本例的 `/app`）。
 
+### G. 暴露端口：EXPOSE 是声明，`-p` 才开门（10-28）
+
+Dockerfile 升级成真网页服务（五行版）：
+```
+FROM alpine:3.20
+RUN sed -i 's/dl-cdn.alpinelinux.org/mirrors.tuna.tsinghua.edu.cn/' /etc/apk/repositories && apk add --no-cache busybox-extras
+COPY hello.txt /app/index.html
+EXPOSE 80
+CMD ["httpd", "-f", "-p", "80", "-h", "/app"]
+```
+
+三条机制结论：
+1. **alpine 把 httpd 拆进了 `busybox-extras` 包**：`docker run --rm alpine:3.20 busybox --list | grep httpd` 无输出＝基础镜像里没有这个程序（瘦身设计）。`RUN` 在 build 时把 apk 源换成清华镜像再装包，结果焊进镜像层——所以镜像变大，但换任何机器重 build 都能复原。
+2. **`EXPOSE 80` 只是元数据声明**（「本服务打算用 80」），`docker ps` 能显示它，但它**不改任何网络规则**；**`-p 8080:80` 才在宿主机内核 iptables 写 DNAT 规则**，把外部 8080 的流量改写到容器 80。门牌读法：左边宿主机、右边容器。所以改门牌只要换 run 参数，**不用重建镜像**。
+3. **同一个镜像，两种 run，两种结果**（两次实验对比）：
+   - 不加 `-p`：`docker ps` 的 PORTS 只有 `80/tcp`（声明可见、无箭头），`curl localhost:8080` → `Connection refused`（门没开）。
+   - 加 `-p 8080:80`：PORTS 变 `0.0.0.0:8080->80/tcp, [::]:8080->80/tcp`（0.0.0.0＝IPv4 全网卡、[::]＝同一扇门开在 IPv6），`curl localhost:8080` → 打印 `hello from inside the image`。
+
+踩坑三连（同一天，全是「少一个字符」级）：
+- `CMD ["httpd","-f","p","80",…]`：`"p"` 少了杠 → httpd 收到不认识的参数。
+- `apk add --no cache`：`--no-cache` 中间变空格 → apk 甩出满屏 usage（用法说明）＋ `exit code: 1`。**判读规律：满屏选项列表＝参数写错了**；`exit code 0`＝成功、非 0＝失败，是 Linux 通用约定。
+- heredoc 重写后 RUN 行丢失 → `cat Dockerfile` 复验当场抓回。**改文件必 cat 复验；盯「杠、引号、空格」三件套。**
+
+排障判读地图（本单元沉淀）：
+| 现象 | 哪一层 | 下一步 |
+|---|---|---|
+| 报错含 `Dockerfile:N` | 文件层（第 N 行） | 改文件 → 重新 build |
+| `exec: "...": executable file not found in $PATH` | 镜像内容层（缺程序） | 装包（RUN apk add）→ 重建 |
+| 容器 `Up` 但 curl `Connection refused` | 运行参数层（没 `-p`） | 带 `-p` 重 run |
+| curl `404` | 容器内路径/文件名 | 查 `/app/index.html` 拼写 |
+
 ## 环境墙实战（troubleshooting，真实踩坑）
 
 - 现象：把 CMD 改成 JSON 形式后重跑 `docker build -t myhello:v2 .`，报
@@ -131,6 +162,7 @@ d9e853e87e55   6 months ago  CMD ["/bin/sh"]                                0B
   2. 但仍失败：daocloud 回 `403 Forbidden … this image is not in the allowlist`（第二次撞同一政策），1ms 也不给。`--offline` 标志此 buildx 版本不支持（`unknown flag: --offline`）。
   3. **最终绕法：`FROM` 直接写本地镜像 ID**（`FROM d9e853e87e55`）＋ `DOCKER_BUILDKIT=0` —— 老构建器按 ID 直接查本地，**不发任何网络请求**，`Step 1/4` 直接命中。
 - **边界（必须写清）**：用镜像 ID 只是**离线应急**——ID 只在本机有效、不可移植，也不进公开仓库的正式版本；有网络时 FROM 仍应写短名（`alpine:3.20`）。同一条 Dockerfile 在本机跑通≠别人的机器能构建。
+- **第四次（10-28）**：默认 BuildKit 下照抄「FROM 本地镜像 ID」应急法，报 `403 Forbidden … not in the allowlist`。根因：**BuildKit 把纯 ID 当成仓库名**（`docker.io/library/d9e853e87e55`）去远端查 metadata——「ID 应急法」只在 `DOCKER_BUILDKIT=0` 老构建器下成立，BuildKit 不认。处置：FROM 改回短名 `alpine:3.20`（daemon.json 加速已在位，短名解析成功）→ build 通过。**修正后的默认写法：有网时 FROM 一律短名；ID 应急仅在老构建器下可用。**
 - ~~待办：把稳定源写进 `daemon.json`~~ → **已完成（10-26，见第三次处置第 1 条）**；但镜像站本身不稳定，仍需保留「先用 ID/短名跑通、再换源重试」的习惯。
 
 ## 命令小记（本次新出现）
